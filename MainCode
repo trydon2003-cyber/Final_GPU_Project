@@ -96,3 +96,67 @@ grid_size = (
     (width + 7) // 8,
     (height + 7) // 8
 )
+
+#Records current time
+start = time.time()
+
+#Rund the CUDA function with arguments from our image passed by Python
+func(img_gpu, out_gpu, np.int32(width), np.int32(height),
+     block=block_size, grid=grid_size)
+
+#Forces CPU to wait for GPU to finish, important for timing and accurate results
+cuda.Context.synchronize()
+
+#Find total time betwen previous time and current time.
+blur_gpu_time = time.time() - start
+
+#Create a new NumPy array
+gpu_result = np.empty_like(arr)
+#Device to host copy
+cuda.memcpy_dtoh(gpu_result, out_gpu)
+#Convert form numeric array to image format and save results
+Image.fromarray(gpu_result.astype(np.uint8)).save("gpu_blur.jpg")
+
+#Define function for CPU Blur
+def average_blur_cpu(image):
+    #Define a 3x3 blur filter
+    kernel_size = 3
+    #Radius of the kernel
+    R = 1
+    #Get image dimensions
+    h, w = image.shape
+    
+    #Create a new array for results
+    output = np.zeros_like(image, dtype=np.float32)
+    #Add a border around the image (similar to the GPU Halo pixels)
+    padded = np.pad(image, pad_width=R, mode='constant', constant_values=0)
+
+    for y in range(h):
+        for x in range(w):
+            #Stores sum for all 3x3 neighbors
+            val = 0.0
+            for i in range(kernel_size):
+                for j in range(kernel_size):
+                    #Reads pixels form padded image
+                    val += padded[y + i, x + j]
+            #Output average blur        
+            output[y, x] = val / 9.0
+
+    return output
+
+#Start timer
+start = time.time()
+
+#Run CPU blur function
+cpu_result = average_blur_cpu(arr)
+
+#Record time
+blur_cpu_time = time.time() - start
+
+#Convert from float to image format
+Image.fromarray(cpu_result.astype(np.uint8)).save("cpu_blur.jpg")
+
+#Display time results
+print(f"CPU Blur Time: {blur_cpu_time:.4f} seconds")
+print(f"GPU Blur Time: {blur_gpu_time:.4f} seconds")
+print(f"Blur Time Difference: {blur_cpu_time / blur_gpu_time:.2f}x")
