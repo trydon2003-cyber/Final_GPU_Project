@@ -1,0 +1,35 @@
+#Load and define numpy
+import numpy as np
+#Call image loading function from Pillow
+from PIL import Image
+#Load and define Pycuda library
+import pycuda.driver as cuda
+import pycuda.autoinit
+from pycuda.compiler import SourceModule
+#Load time library for CPU vs GPU comparison
+import time
+
+#Find and load image, and define it as a variable, interpreet it in greyscale mode
+img = Image.open(r"C:\Users\TryDo\Downloads\pexels-jplenio-1146708.jpg").convert("L")
+#Convert the image into a NumPy matrix as float32 type
+arr = np.array(img, dtype=np.float32)
+#Define the height and width of the image.
+height, width = arr.shape
+
+#Allocate GPU memory
+#Create an GPU side array that is the same size as the image
+img_gpu = cuda.mem_alloc(arr.nbytes)
+#Copy NumPy array from CPU to GPU memory
+cuda.memcpy_htod(img_gpu, arr)
+#Allocate another GPU buffer that will store the blurred image
+out_gpu = cuda.mem_alloc(arr.nbytes)
+
+# CUDA Kernel, now with shared memory
+#SourceModule is a function that compiles all of our CUDA C code.
+mod = SourceModule("""
+//Since the Code is now C, all comments will look like this
+//A function that is marked as a GPU kernel that can be called from python  
+
+""")
+#Connects Pythong code to compiled CUDA kernel, and lets us execute the GPU code
+func = mod.get_function("average_shared")
