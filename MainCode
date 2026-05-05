@@ -29,7 +29,70 @@ out_gpu = cuda.mem_alloc(arr.nbytes)
 mod = SourceModule("""
 //Since the Code is now C, all comments will look like this
 //A function that is marked as a GPU kernel that can be called from python  
+//Computer each block as an 8x8 chunk
+#define TILE_SIZE 8
+//Raddius for a 3x3 filter                   
+#define R 1   
 
+//Running a function on the GPU using input and output variables and the image dimensions                   
+__global__ void average_shared(float* input, float* output, int width, int height)
+{
+    //Allocate fast on-chip memory               
+    __shared__ float tile[TILE_SIZE + 2*R][TILE_SIZE + 2*R];
+
+    //Local thread position inside block
+    int tx = threadIdx.x;
+    int ty = threadIdx.y;
+
+    //Map each thread to a pixel in the full image
+    int row_o = blockIdx.y * TILE_SIZE + ty;
+    int col_o = blockIdx.x * TILE_SIZE + tx;
+
+    //Loads surrongding pixels aka the Halo region            
+    int row_i = row_o - R;
+    int col_i = col_o - R;
+
+    //Load into shared memory (with halo)
+    if (row_i >= 0 && row_i < height && col_i >= 0 && col_i < width)
+        tile[ty][tx] = input[row_i * width + col_i];
+    else
+        tile[ty][tx] = 0.0f;
+
+    //Finish loading all threads before computations
+    __syncthreads();
+
+    //Only compute valid threads
+    if (tx < TILE_SIZE && ty < TILE_SIZE)
+    {
+        float sum = 0.0f;
+
+        //3x3 average filter
+        for (int i = 0; i < 3; i++)
+        {
+            for (int j = 0; j < 3; j++)
+            {
+                sum += tile[ty + i][tx + j];
+            }
+        }
+
+        //Prevents writing outside image bounds           
+        if (row_o < height && col_o < width)
+        {
+            //Store blurred pixel       
+            output[row_o * width + col_o] = sum / 9.0f;
+        }
+    }
+}
 """)
 #Connects Pythong code to compiled CUDA kernel, and lets us execute the GPU code
 func = mod.get_function("average_shared")
+
+
+#Establish the blocks and grid
+#Each block has 64 threads (8*8)
+block_size = (8,8,1)
+#Calculates the amount of blocks needed to cover the image
+grid_size = (
+    (width + 7) // 8,
+    (height + 7) // 8
+)
