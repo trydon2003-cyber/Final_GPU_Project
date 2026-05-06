@@ -27,15 +27,15 @@ out_gpu = cuda.mem_alloc(arr.nbytes)
 # CUDA Kernel, now with shared memory
 #SourceModule is a function that compiles all of our CUDA C code.
 mod = SourceModule("""
-//Since the Code is now C, all comments will look like this
-//A function that is marked as a GPU kernel that can be called from python  
+#include <stdio.h>
+
 //Computer each block as an 8x8 chunk
 #define TILE_SIZE 8
-//Raddius for a 3x3 filter                   
+//Radius for a 3x3 filter                   
 #define R 1   
 
 //Running a function on the GPU using input and output variables and the image dimensions                   
-__global__ void average_shared(float* input, float* output, int width, int height)
+__global__ void Gaussian_Blur(float* input, float* output, int width, int height)
 {
     //Allocate fast on-chip memory               
     __shared__ float tile[TILE_SIZE + 2*R][TILE_SIZE + 2*R];
@@ -44,119 +44,228 @@ __global__ void average_shared(float* input, float* output, int width, int heigh
     int tx = threadIdx.x;
     int ty = threadIdx.y;
 
-    //Map each thread to a pixel in the full image
+    //Global position (output pixel)
     int row_o = blockIdx.y * TILE_SIZE + ty;
     int col_o = blockIdx.x * TILE_SIZE + tx;
 
-    //Loads surrongding pixels aka the Halo region            
-    int row_i = row_o - R;
-    int col_i = col_o - R;
+    //Shared memory dimensions
+    int shared_w = TILE_SIZE + 2*R;
 
-    //Load into shared memory (with halo)
-    if (row_i >= 0 && row_i < height && col_i >= 0 && col_i < width)
-        tile[ty][tx] = input[row_i * width + col_i];
-    else
-        tile[ty][tx] = 0.0f;
+    //Load FULL tile (including halo) using striding
+    for (int y = ty; y < shared_w; y += TILE_SIZE)
+    {
+        for (int x = tx; x < shared_w; x += TILE_SIZE)
+        {
+            int row_i = blockIdx.y * TILE_SIZE + y - R;
+            int col_i = blockIdx.x * TILE_SIZE + x - R;
+
+            if (row_i >= 0 && row_i < height && col_i >= 0 && col_i < width)
+                tile[y][x] = input[row_i * width + col_i];
+            else
+                tile[y][x] = 0.0f;
+        }
+    }
 
     //Finish loading all threads before computations
     __syncthreads();
 
     //Only compute valid threads
-    if (tx < TILE_SIZE && ty < TILE_SIZE)
+    if (row_o < height && col_o < width)
     {
+        float kernel[3][3] = {
+            {1, 2, 1},
+            {2, 4, 2},
+            {1, 2, 1}
+        };
+
         float sum = 0.0f;
 
-        //3x3 average filter
+        //3x3 Gaussian filter
         for (int i = 0; i < 3; i++)
         {
             for (int j = 0; j < 3; j++)
             {
-                sum += tile[ty + i][tx + j];
+                sum += tile[ty + i][tx + j] * kernel[i][j];
             }
         }
 
-        //Prevents writing outside image bounds           
-        if (row_o < height && col_o < width)
-        {
-            //Store blurred pixel       
-            output[row_o * width + col_o] = sum / 9.0f;
-        }
+        //Store blurred pixel       
+        output[row_o * width + col_o] = sum / 16.0f;
     }
 }
+
+//Global memory version (no shared memory optimization)
+__global__ void Gaussian_Blur_Global(float* input, float* output, int width, int height)
+{
+    //Local thread position inside block
+    int tx = threadIdx.x;
+    int ty = threadIdx.y;
+
+    //Map each thread to a pixel in the full image
+    int row = blockIdx.y * blockDim.y + ty;
+    int col = blockIdx.x * blockDim.x + tx;
+
+    //Ensure thread is inside image bounds
+    if (row >= height || col >= width)
+        return;
+
+    float kernel[3][3] = {
+        {1, 2, 1},
+        {2, 4, 2},
+        {1, 2, 1}
+    };
+
+    float sum = 0.0f;
+
+    //Loop over 3x3 neighborhood
+    for (int i = -1; i <= 1; i++)
+    {
+        for (int j = -1; j <= 1; j++)
+        {
+            int r = row + i;
+            int c = col + j;
+
+            //Boundary check (zero padding)
+            if (r >= 0 && r < height && c >= 0 && c < width)
+            {
+                sum += input[r * width + c] * kernel[i + 1][j + 1];
+            }
+        }
+    }
+
+    //Store result
+    output[row * width + col] = sum / 16.0f;
+}
 """)
-#Connects Pythong code to compiled CUDA kernel, and lets us execute the GPU code
-func = mod.get_function("average_shared")
+
+#Connects Python code to compiled CUDA kernel, and lets us execute the GPU code
+func = mod.get_function("Gaussian_Blur")
+func_global = mod.get_function("Gaussian_Blur_Global")
 
 
 #Establish the blocks and grid
 #Each block has 64 threads (8*8)
-block_size = (8,8,1)
+block_size = (8, 8, 1)
 #Calculates the amount of blocks needed to cover the image
 grid_size = (
     (width + 7) // 8,
     (height + 7) // 8
 )
 
-#Records current time
+#H2D Transfer timing
 start = time.time()
+cuda.memcpy_htod(img_gpu, arr)
+h2d_time = time.time() - start
 
-#Rund the CUDA function with arguments from our image passed by Python
-func(img_gpu, out_gpu, np.int32(width), np.int32(height),
-     block=block_size, grid=grid_size)
+#GPU Global Memory timing
+start_event = cuda.Event()
+end_event = cuda.Event()
 
-#Forces CPU to wait for GPU to finish, important for timing and accurate results
-cuda.Context.synchronize()
+#Start recording time
+start_event.record()
 
-#Find total time betwen previous time and current time.
-blur_gpu_time = time.time() - start
+#Call global memory function
+func_global(img_gpu, out_gpu, np.int32(width), np.int32(height), block=block_size, grid=grid_size)
+
+#Synchronize threads for better time accuracy
+end_event.record()
+end_event.synchronize()
+
+#Record time and convert to seconds
+gpu_global_time = start_event.time_till(end_event) * 1e-3 
+
+#GPU shared memory timing
+start_event = cuda.Event()
+end_event = cuda.Event()
+
+#Start recording time
+start_event.record()
+
+#Call shared memory function
+func(img_gpu, out_gpu, np.int32(width), np.int32(height),block=block_size, grid=grid_size)
+
+#Stop timer and synchronzie
+end_event.record()
+end_event.synchronize()
+
+#Record time and set to seconds
+gpu_shared_time = start_event.time_till(end_event) * 1e-3
+
+
+#D2H Transfer timing
+start = time.time()
 
 #Create a new NumPy array
 gpu_result = np.empty_like(arr)
 #Device to host copy
 cuda.memcpy_dtoh(gpu_result, out_gpu)
+
+d2h_time = time.time() - start
+
 #Convert form numeric array to image format and save results
 Image.fromarray(gpu_result.astype(np.uint8)).save("gpu_blur.jpg")
 
-#Define function for CPU Blur
-def average_blur_cpu(image):
-    #Define a 3x3 blur filter
+
+#CPU Blur Function (baseline)
+def gaussian_blur_cpu(image):
+    #3x3 Gaussian filter kernel
+    kernel = np.array([
+        [1, 2, 1],
+        [2, 4, 2],
+        [1, 2, 1]
+    ], dtype=np.float32)
+
+    #Define kernel size and radius
     kernel_size = 3
-    #Radius of the kernel
     R = 1
-    #Get image dimensions
     h, w = image.shape
-    
-    #Create a new array for results
+
+    #Create an output array
     output = np.zeros_like(image, dtype=np.float32)
-    #Add a border around the image (similar to the GPU Halo pixels)
+    #Create padding for the edges of the image
     padded = np.pad(image, pad_width=R, mode='constant', constant_values=0)
 
+    #Loop for every pixel
     for y in range(h):
         for x in range(w):
-            #Stores sum for all 3x3 neighbors
+            #Accumulator
             val = 0.0
             for i in range(kernel_size):
                 for j in range(kernel_size):
-                    #Reads pixels form padded image
-                    val += padded[y + i, x + j]
-            #Output average blur        
-            output[y, x] = val / 9.0
-
+                    #Apply convolution
+                    val += padded[y + i, x + j] * kernel[i, j]
+            #Normalize results
+            output[y, x] = val / 16.0
+    #Return the final image
     return output
 
-#Start timer
+#Start CPU timer
 start = time.time()
 
 #Run CPU blur function
-cpu_result = average_blur_cpu(arr)
+cpu_result = gaussian_blur_cpu(arr)
 
 #Record time
-blur_cpu_time = time.time() - start
+cpu_time = time.time() - start
 
 #Convert from float to image format
 Image.fromarray(cpu_result.astype(np.uint8)).save("cpu_blur.jpg")
 
-#Display time results
-print(f"CPU Blur Time: {blur_cpu_time:.4f} seconds")
-print(f"GPU Blur Time: {blur_gpu_time:.4f} seconds")
-print(f"Blur Time Difference: {blur_cpu_time / blur_gpu_time:.2f}x")
+
+#Print out all results and comparisons
+print("\n--- PERFORMANCE RESULTS ---")
+print(f"CPU Blur Time: {cpu_time:.6f} seconds")
+
+print("\n--- GPU TIMINGS ---")
+print(f"H2D Transfer Time: {h2d_time:.6f} seconds")
+print(f"D2H Transfer Time: {d2h_time:.6f} seconds")
+
+print("\n--- KERNEL TIMES ---")
+print(f"GPU Global Memory Time: {gpu_global_time:.6f} seconds")
+print(f"GPU Shared Memory Time: {gpu_shared_time:.6f} seconds")
+
+print("\n--- SPEEDUPS ---")
+print(f"Shared vs Global Speedup: {gpu_global_time / gpu_shared_time:.6f}x")
+print(f"CPU vs Shared Speedup: {cpu_time / gpu_shared_time:.6f}x")
+
+print(f"\nTotal GPU Time: {h2d_time + gpu_shared_time + d2h_time:.6f} seconds")
