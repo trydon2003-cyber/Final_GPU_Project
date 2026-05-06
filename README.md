@@ -10,4 +10,18 @@ Hardware Used for this project:
     4. Select Python 3.11.9, make sure to close current terminal and opening a new one.
 
 Performance Table Summary:
-  
+Gaussian Blur table
+--- PERFORMANCE RESULTS ---
+CPU Blur Time: 24.841272 seconds
+
+--- GPU TIMINGS ---
+H2D Transfer Time: 0.006025 seconds
+D2H Transfer Time: 0.009031 seconds
+
+--- KERNEL TIMES ---
+GPU Global Memory Time: 0.000243 seconds
+GPU Shared Memory Time: 0.000213 seconds
+
+--- SPEEDUPS ---
+Shared vs Global Speedup: 1.139256x
+CPU vs Shared Speedup: 116490.059312x  
