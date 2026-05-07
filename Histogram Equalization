@@ -1,0 +1,160 @@
+#Load and define numpy
+import numpy as np
+#Call image loading function from Pillow
+from PIL import Image
+#Load and define Pycuda library
+import pycuda.driver as cuda
+import pycuda.autoinit
+from pycuda.compiler import SourceModule
+#Load time library for CPU vs GPU comparison
+import time
+
+#Find and load image, and define it as a variable, interpreet it in greyscale mode
+img = Image.open(r"C:\Users\TryDo\Downloads\pexels-jplenio-1146708.jpg").convert("L")
+#Convert the image into a NumPy matrix as float32 type
+arr = np.array(img, dtype=np.float32)
+#Define the height and width of the image.
+height, width = arr.shape
+
+#Allocate GPU memory
+#Create an GPU side array that is the same size as the image
+img_gpu = cuda.mem_alloc(arr.nbytes)
+#Copy NumPy array from CPU to GPU memory
+cuda.memcpy_htod(img_gpu, arr)
+#Allocate another GPU buffer that will store the blurred image
+out_gpu = cuda.mem_alloc(arr.nbytes)
+
+# CUDA Kernel, now with shared memory
+#SourceModule is a function that compiles all of our CUDA C code.
+mod = SourceModule("""
+#include <stdio.h>
+
+//Constant histogram size               
+#define BINS 256
+
+//KERNEL 1: SHARED MEMORY HISTOGRAM (BLOCK-LOCAL)
+__global__ void histogram_kernel(unsigned char* input,int* global_hist,int size)
+{
+    
+    //Allocate shared memory per block
+    __shared__ int local_hist[BINS];
+
+    //Thread index inside the block
+    int tid = threadIdx.x;
+    //Computes global pixel index
+    int idx = blockIdx.x * blockDim.x + tid;
+
+    //Initialize shared histogram
+    if (tid < BINS)
+        local_hist[tid] = 0;
+    
+    //Ensure all threads finish initialization
+    __syncthreads();
+
+    //Build block-local histogram
+    if (idx < size)
+    {
+        //Read pixel intensity
+        unsigned char pixel = input[idx];
+
+        //Increments histogram bin and prevents race conditions
+        atomicAdd(&local_hist[pixel], 1);
+    }
+
+    //Ensure all pixels are processed
+    __syncthreads();
+
+    
+    //Merge into global histogram
+    if (tid < BINS)
+    {
+        //Each block constributes its histrogram
+        atomicAdd(&global_hist[tid], local_hist[tid]);
+    }
+}
+""")
+
+#Connects Python code to compiled CUDA kernel, and lets us execute the GPU code
+func = mod.get_function("histrogram_kernl")
+
+
+#Establish the blocks and grid
+#Allow for non-square support
+block_size = (16, 4, 1)  
+
+grid_size = (
+    (width + block_size[0] - 1) // block_size[0],
+    (height + block_size[1] - 1) // block_size[1]
+)
+
+
+#H2D Transfer timing
+start = time.time()
+cuda.memcpy_htod(img_gpu, arr)
+h2d_time = time.time() - start
+
+
+#GPU shared memory timing
+start_event = cuda.Event()
+end_event = cuda.Event()
+
+#Start recording time
+start_event.record()
+
+#Call shared memory function
+
+#Synchronize threads for better time accuracy
+end_event.record()
+end_event.synchronize()
+
+#Record time and convert to seconds
+gpu_shared_time = start_event.time_till(end_event) * 1e-3 
+
+
+#D2H Transfer timing
+start = time.time()
+
+#Create a new NumPy array
+gpu_result = np.empty_like(arr)
+#Device to host copy
+cuda.memcpy_dtoh(gpu_result, out_gpu)
+
+d2h_time = time.time() - start
+
+#Normalize Sobel output
+gpu_result_norm = np.clip(gpu_result, 0, 255)
+#Save image after Sobel edge detection
+Image.fromarray(gpu_result_norm.astype(np.uint8)).save("gpu_sobel.jpg")
+
+
+#Start CPU timer
+#start = time.time()
+
+#Run CPU Sobel Function
+#cpu_result = sobel_cpu(arr)
+
+#Record time
+#cpu_time = time.time() - start
+
+#Normalize CPU Sobel output
+#cpu_result_norm = np.clip(cpu_result, 0, 255)
+
+#Convert normalize result to image format
+#Image.fromarray(cpu_result_norm.astype(np.uint8)).save("cpu_sobel.jpg")
+
+
+#Print out all results and comparisons
+print("\n--- PERFORMANCE RESULTS ---")
+#print(f"CPU Histogram Equalization: {cpu_time:.6f} seconds")
+
+print("\n--- GPU TIMINGS ---")
+print(f"H2D Transfer Time: {h2d_time:.6f} seconds")
+print(f"D2H Transfer Time: {d2h_time:.6f} seconds")
+
+print("\n--- KERNEL TIMES ---")
+print(f"GPU Shared Memory Time: {gpu_shared_time:.6f} seconds")
+
+print("\n--- SPEEDUPS ---")
+#print(f"CPU vs Shared Speedup: {cpu_time / gpu_shared_time:.6f}x")
+
+print(f"\nTotal GPU Time: {h2d_time + gpu_shared_time + d2h_time:.6f} seconds")
