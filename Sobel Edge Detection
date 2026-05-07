@@ -234,7 +234,7 @@ Image.fromarray(cpu_result_norm.astype(np.uint8)).save("cpu_sobel.jpg")
 
 #Print out all results and comparisons
 print("\n--- PERFORMANCE RESULTS ---")
-print(f"CPU Blur Time: {cpu_time:.6f} seconds")
+print(f"CPU Sobel Edge Detection Time: {cpu_time:.6f} seconds")
 
 print("\n--- GPU TIMINGS ---")
 print(f"H2D Transfer Time: {h2d_time:.6f} seconds")
