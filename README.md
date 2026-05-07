@@ -25,3 +25,19 @@ GPU Shared Memory Time: 0.000213 seconds
 --- SPEEDUPS ---
 Shared vs Global Speedup: 1.139256x
 CPU vs Shared Speedup: 116490.059312x  
+
+Sobel Edge Detection table:
+--- PERFORMANCE RESULTS ---
+CPU Blur Time: 43.941375 seconds
+
+--- GPU TIMINGS ---
+H2D Transfer Time: 0.006508 seconds
+D2H Transfer Time: 0.012010 seconds
+
+--- KERNEL TIMES ---
+GPU Shared Memory Time: 0.000312 seconds
+
+--- SPEEDUPS ---
+CPU vs Shared Speedup: 140866.641731x
+
+Total GPU Time: 0.018829 seconds
