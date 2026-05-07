@@ -159,26 +159,71 @@ gpu_result_norm = np.clip(gpu_result, 0, 255)
 #Save image after Sobel edge detection
 Image.fromarray(gpu_result_norm.astype(np.uint8)).save("gpu_sobel.jpg")
 
+#CPU Sobel Edge Detection Function
+def sobel_cpu(image):
 
-#CPU Blur Function (baseline)
-#def gaussian_blur_cpu(image)
+    #Sobel horizontal gradient kernel
+    Gx = np.array([
+        [-1, 0, 1],
+        [-2, 0, 2],
+        [-1, 0, 1]
+    ], dtype=np.float32)
+
+    #Sobel vertical gradient kernel
+    Gy = np.array([
+        [-1, -2, -1],
+        [ 0,  0,  0],
+        [ 1,  2,  1]
+    ], dtype=np.float32)
+
+    #Image dimensions
+    height, width = image.shape
+
+    #Output image
+    output = np.zeros_like(image, dtype=np.float32)
+
+    #Pad image to handle boundaries
+    padded = np.pad(image, pad_width=1, mode='constant', constant_values=0)
+
+    #Loop through every pixel
+    for y in range(height):
+        for x in range(width):
+
+            #Store horizontal and vertical gradients
+            sx = 0.0
+            sy = 0.0
+
+            #Apply 3x3 Sobel filters
+            for i in range(3):
+                for j in range(3):
+
+                    pixel = padded[y + i, x + j]
+
+                    sx += pixel * Gx[i, j]
+                    sy += pixel * Gy[i, j]
+
+            #Compute edge magnitude
+            output[y, x] = np.sqrt(sx * sx + sy * sy)
+
+    return output
+
 
 #Start CPU timer
-#start = time.time()
+start = time.time()
 
-#Run CPU blur function
-#cpu_result = gaussian_blur_cpu(arr)
+#Run CPU Sobel Function
+cpu_result = sobel_cpu(arr)
 
 #Record time
-#cpu_time = time.time() - start
+cpu_time = time.time() - start
 
 #Convert from float to image format
-#Image.fromarray(cpu_result.astype(np.uint8)).save("cpu_blur.jpg")
+Image.fromarray(cpu_result.astype(np.uint8)).save("cpu_sobel.jpg")
 
 
 #Print out all results and comparisons
 print("\n--- PERFORMANCE RESULTS ---")
-#print(f"CPU Blur Time: {cpu_time:.6f} seconds")
+print(f"CPU Blur Time: {cpu_time:.6f} seconds")
 
 print("\n--- GPU TIMINGS ---")
 print(f"H2D Transfer Time: {h2d_time:.6f} seconds")
@@ -188,6 +233,6 @@ print("\n--- KERNEL TIMES ---")
 print(f"GPU Shared Memory Time: {gpu_shared_time:.6f} seconds")
 
 print("\n--- SPEEDUPS ---")
-#print(f"CPU vs Shared Speedup: {cpu_time / gpu_shared_time:.6f}x")
+print(f"CPU vs Shared Speedup: {cpu_time / gpu_shared_time:.6f}x")
 
 print(f"\nTotal GPU Time: {h2d_time + gpu_shared_time + d2h_time:.6f} seconds")
