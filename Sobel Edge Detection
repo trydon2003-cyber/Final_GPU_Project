@@ -38,7 +38,7 @@ __global__ void Sobel_Shared(float* input, float* output, int width, int height)
 {
 
     //Creates fast on-chip memory per block               
-    extern __shared__ float tile[10][10];
+    __shared__ float tile[10][10];
                    
     //Map each thread knows its location
     int tx = threadIdx.x;
@@ -217,8 +217,11 @@ cpu_result = sobel_cpu(arr)
 #Record time
 cpu_time = time.time() - start
 
-#Convert from float to image format
-Image.fromarray(cpu_result.astype(np.uint8)).save("cpu_sobel.jpg")
+#Normalize CPU Sobel output
+cpu_result_norm = np.clip(cpu_result, 0, 255)
+
+#Convert normalize result to image format
+Image.fromarray(cpu_result_norm.astype(np.uint8)).save("cpu_sobel.jpg")
 
 
 #Print out all results and comparisons
