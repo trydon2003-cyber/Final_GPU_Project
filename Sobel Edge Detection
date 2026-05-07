@@ -38,7 +38,7 @@ __global__ void Sobel_Shared(float* input, float* output, int width, int height)
 {
 
     //Creates fast on-chip memory per block               
-    __shared__ float tile[10][10];
+    extern __shared__ float tile[];
                    
     //Map each thread knows its location
     int tx = threadIdx.x;
@@ -49,10 +49,13 @@ __global__ void Sobel_Shared(float* input, float* output, int width, int height)
     int col_o = blockIdx.x * blockDim.x + tx;
 
     //Shared memory width
-    int shared_w = TILE_SIZE + 2*R;
+    int shared_w = blockDim.x + 2 * R;
+    int shared_h = blockDim.y + 2 * R;
+
+    #define TILE(y,x) tile[(y) * shared_w + (x)]
 
     // Load tile + halo
-    for (int y = ty; y < shared_w; y += blockDim.y)
+    for (int y = ty; y < shared_h; y += blockDim.y)
     {
         for (int x = tx; x < shared_w; x += blockDim.x)
         {
@@ -62,9 +65,9 @@ __global__ void Sobel_Shared(float* input, float* output, int width, int height)
 
             //Handles boundaries by copying pixel if it is inside image
             if (row_i >= 0 && row_i < height && col_i >= 0 && col_i < width)
-                tile[y][x] = input[row_i * width + col_i];
+                TILE(y,x) = input[row_i * width + col_i];
             else
-                tile[y][x] = 0.0f;
+                TILE(y,x) = 0.0f;
         }
     }
 
@@ -95,7 +98,7 @@ __global__ void Sobel_Shared(float* input, float* output, int width, int height)
             for (int j = 0; j < 3; j++)
             {
                 //Load pixel from shared memory
-                float val = tile[ty + i][tx + j];
+                float val = TILE(ty + i, tx + j);
                 //Apply Sobel weights for horizontal and vertical gradient
                 sx += val * Gx[i][j];
                 sy += val * Gy[i][j];
@@ -120,6 +123,10 @@ grid_size = (
     (height + block_size[1] - 1) // block_size[1]
 )
 
+R = 1
+#Calcuate how much dynamic shared memoery the kernel needs per block
+shared_mem = (block_size[0] + 2*R) * (block_size[1] + 2*R) * np.float32().nbytes
+
 #H2D Transfer timing
 start = time.time()
 cuda.memcpy_htod(img_gpu, arr)
@@ -134,7 +141,8 @@ end_event = cuda.Event()
 start_event.record()
 
 #Call shared memory function
-func(img_gpu, out_gpu, np.int32(width), np.int32(height),block=block_size, grid=grid_size)
+func(img_gpu,out_gpu,np.int32(width),np.int32(height),block=block_size,
+     grid=grid_size,shared=shared_mem)
 
 #Synchronize threads for better time accuracy
 end_event.record()
