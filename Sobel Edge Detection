@@ -12,120 +12,114 @@ import time
 #Find and load image, and define it as a variable, interpreet it in greyscale mode
 img = Image.open(r"C:\Users\TryDo\Downloads\pexels-jplenio-1146708.jpg").convert("L")
 #Convert the image into a NumPy matrix as float32 type
-arr = np.array(img, dtype=np.float32)
+arr = np.array(img, dtype=np.uint8)
 #Define the height and width of the image.
 height, width = arr.shape
+size = height * width
 
 #Allocate GPU memory
 #Create an GPU side array that is the same size as the image
 img_gpu = cuda.mem_alloc(arr.nbytes)
-#Copy NumPy array from CPU to GPU memory
-cuda.memcpy_htod(img_gpu, arr)
+
 #Allocate another GPU buffer that will store the blurred image
 out_gpu = cuda.mem_alloc(arr.nbytes)
+
+#Histogram and CDF buffers
+#Create space on the GPU for the histogram
+hist_gpu = cuda.mem_alloc(256 * np.int32().nbytes)
+#Create space on the GPU for the Cumulative Distribution Function
+cdf_gpu  = cuda.mem_alloc(256 * np.int32().nbytes)
+#Initialize histogram on GPU
+cuda.memset_d32(hist_gpu, 0, 256)
+
+#Copy NumPy array from CPU to GPU memory
+cuda.memcpy_htod(img_gpu, arr)
 
 # CUDA Kernel, now with shared memory
 #SourceModule is a function that compiles all of our CUDA C code.
 mod = SourceModule("""
 #include <stdio.h>
 
-//Computer each block as an 8x8 chunk
-#define TILE_SIZE 8
-//Radius for a 3x3 filter                   
-#define R 1   
+//Constant histogram size               
+#define BINS 256
 
-__global__ void Sobel_Shared(float* input, float* output, int width, int height)
+//Kernel 1: Shared Memory Histogram
+__global__ void histogram_kernel(unsigned char* input, int* hist, int size)
 {
+    //Creates histogram inside fast shared memory
+    __shared__ int local_hist[256];
 
-    //Creates fast on-chip memory per block               
-    extern __shared__ float tile[];
+    //Each thread is mapped to local index inside the block
+    int tid = threadIdx.x;
+    //Compute which image pixel this thread processess
+    int idx = blockIdx.x * blockDim.x + tid;
+
+    //Initialize shared histogram memory
+    for (int i = tid; i < 256; i += blockDim.x)
+        local_hist[i] = 0;
+
+    //Force all threads in block to wait, prevents race conditions
+    __syncthreads();
                    
-    //Map each thread knows its location
-    int tx = threadIdx.x;
-    int ty = threadIdx.y;
-
-    //Map each thread to a pixel
-    int row_o = blockIdx.y * blockDim.y + ty;
-    int col_o = blockIdx.x * blockDim.x + tx;
-
-    //Shared memory width
-    int shared_w = blockDim.x + 2 * R;
-    int shared_h = blockDim.y + 2 * R;
-
-    #define TILE(y,x) tile[(y) * shared_w + (x)]
-
-    // Load tile + halo
-    for (int y = ty; y < shared_h; y += blockDim.y)
+  if (idx < size)
     {
-        for (int x = tx; x < shared_w; x += blockDim.x)
-        {
-            //Maps shared tile coord to global image coords
-            int row_i = blockIdx.y * blockDim.y + y - R;
-            int col_i = blockIdx.x * blockDim.x + x - R;
-
-            //Handles boundaries by copying pixel if it is inside image
-            if (row_i >= 0 && row_i < height && col_i >= 0 && col_i < width)
-                TILE(y,x) = input[row_i * width + col_i];
-            else
-                TILE(y,x) = 0.0f;
-        }
+        //Load grayscale pixel
+        unsigned char pixel = input[idx];
+        //Increment the histogram bin
+        atomicAdd(&local_hist[pixel], 1);
     }
-
-    //Waits for all threads to finish loading
+                   
+    //Ensure histogram update is complete
     __syncthreads();
 
-    //Prevents out of bound writing at the edges               
-    if (row_o < height && col_o < width)
-    {
-        //Gradient filter           
-        float Gx[3][3] = {
-            {-1, 0, 1},
-            {-2, 0, 2},
-            {-1, 0, 1}
-        };
-        //Gradient filter
-        float Gy[3][3] = {
-            {-1, -2, -1},
-            { 0,  0,  0},
-            { 1,  2,  1}
-        };
-        //Store horizontal and vertical gradient
-        float sx = 0.0f;
-        float sy = 0.0f;
+    if (tid < 256)
+        //Merge into global histogram
+        atomicAdd(&hist[tid], local_hist[tid]);
+}
 
-        for (int i = 0; i < 3; i++)
-        {
-            for (int j = 0; j < 3; j++)
-            {
-                //Load pixel from shared memory
-                float val = TILE(ty + i, tx + j);
-                //Apply Sobel weights for horizontal and vertical gradient
-                sx += val * Gx[i][j];
-                sy += val * Gy[i][j];
-            }
-        }
-        //Compute the final edge magnitude
-        output[row_o * width + col_o] = sqrtf(sx * sx + sy * sy);
+//Kernel 2: Equalization                   
+__global__ void equalization_kernel(unsigned char* input,unsigned char* output, int* cdf,
+int size,int cdf_min)
+{
+    //Create unique global pixel index per thread
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+
+   if (idx < size)
+    {
+        int pixel = input[idx];
+
+        //Normalize histogram equaliztion
+        float denom = (float)(size - cdf_min);
+        //Prevents divide by zero errors
+        if (denom < 1.0f) denom = 1.0f;
+
+        //Histogram equalization formula, redistributes intensities.
+        float value = ((cdf[pixel] - cdf_min) / denom) * 255.0f;
+                   
+        //Prevent invalid negative intensities
+        if (value < 0) value = 0;
+        //Prevents overflow beyound 8-bit
+        if (value > 255) value = 255;
+
+        output[idx] = (unsigned char)value;
     }
 }
 """)
 
 #Connects Python code to compiled CUDA kernel, and lets us execute the GPU code
-func = mod.get_function("Sobel_Shared")
+hist = mod.get_function("histogram_kernel")
+eq = mod.get_function("equalization_kernel")
 
 
 #Establish the blocks and grid
-#Allow for non-square support
-block_size = (16, 4, 1)  
+block_size = (256, 1, 1)  
 
 grid_size = (
-    (width + block_size[0] - 1) // block_size[0],
-    (height + block_size[1] - 1) // block_size[1]
+    (size + block_size[0] - 1) // block_size[0],
+    1,
+    1
 )
 
-R = 1
-#Calcuate how much dynamic shared memoery the kernel needs per block
-shared_mem = (block_size[0] + 2*R) * (block_size[1] + 2*R) * np.float32().nbytes
 
 #H2D Transfer timing
 start = time.time()
@@ -140,110 +134,91 @@ end_event = cuda.Event()
 #Start recording time
 start_event.record()
 
-#Call shared memory function
-func(img_gpu,out_gpu,np.int32(width),np.int32(height),block=block_size,
-     grid=grid_size,shared=shared_mem)
+#Run histogram kernl
+hist(img_gpu, hist_gpu, np.int32(size),block=block_size, grid=grid_size)
+
+#Create CPU histogram array
+hist_cpu = np.zeros(256, dtype=np.int32)
+#Copy histogram from GPU to CPU
+cuda.memcpy_dtoh(hist_cpu, hist_gpu)
+
+#Compute the CDF
+cdf = np.cumsum(hist_cpu).astype(np.int32)
+
+#Initialize minimum non-zero CDF
+cdf_min = 0
+#Iterates through the CDF
+for v in cdf:
+    #Make sure the CDF has a value
+    if v != 0:
+        #Store first non-zero cumulative frequency
+        cdf_min = v
+        break
+
+#Send the CDF to the GPU
+cuda.memcpy_htod(cdf_gpu,cdf)
+
+#Run equalization kernel
+eq(img_gpu, out_gpu, cdf_gpu,np.int32(size), np.int32(cdf_min),block=block_size, grid=grid_size)
 
 #Synchronize threads for better time accuracy
 end_event.record()
 end_event.synchronize()
 
 #Record time and convert to seconds
-gpu_shared_time = start_event.time_till(end_event) * 1e-3 
+gpu_time = start_event.time_till(end_event) * 1e-3 
 
+#Create an empty array
+result = np.empty_like(arr)
+#Copy data from GPU to CPU
+cuda.memcpy_dtoh(result, out_gpu)
+
+#Save new image result
+Image.fromarray(result).save("gpu_equalized.jpg")
 
 #D2H Transfer timing
+end_event.record()
+end_event.synchronize()
+
 start = time.time()
 
-#Create a new NumPy array
+# Create output buffer
 gpu_result = np.empty_like(arr)
-#Device to host copy
+
+# Copy final equalized image back to host
 cuda.memcpy_dtoh(gpu_result, out_gpu)
 
 d2h_time = time.time() - start
 
-#Normalize Sobel output
-gpu_result_norm = np.clip(gpu_result, 0, 255)
-#Save image after Sobel edge detection
-Image.fromarray(gpu_result_norm.astype(np.uint8)).save("gpu_sobel.jpg")
-
-#CPU Sobel Edge Detection Function
-def sobel_cpu(image):
-
-    #Sobel horizontal gradient kernel
-    Gx = np.array([
-        [-1, 0, 1],
-        [-2, 0, 2],
-        [-1, 0, 1]
-    ], dtype=np.float32)
-
-    #Sobel vertical gradient kernel
-    Gy = np.array([
-        [-1, -2, -1],
-        [ 0,  0,  0],
-        [ 1,  2,  1]
-    ], dtype=np.float32)
-
-    #Image dimensions
-    height, width = image.shape
-
-    #Output image
-    output = np.zeros_like(image, dtype=np.float32)
-
-    #Pad image to handle boundaries
-    padded = np.pad(image, pad_width=1, mode='constant', constant_values=0)
-
-    #Loop through every pixel
-    for y in range(height):
-        for x in range(width):
-
-            #Store horizontal and vertical gradients
-            sx = 0.0
-            sy = 0.0
-
-            #Apply 3x3 Sobel filters
-            for i in range(3):
-                for j in range(3):
-
-                    pixel = padded[y + i, x + j]
-
-                    sx += pixel * Gx[i, j]
-                    sy += pixel * Gy[i, j]
-
-            #Compute edge magnitude
-            output[y, x] = np.sqrt(sx * sx + sy * sy)
-
-    return output
-
 
 #Start CPU timer
-start = time.time()
+#start = time.time()
 
 #Run CPU Sobel Function
-cpu_result = sobel_cpu(arr)
+#cpu_result = sobel_cpu(arr)
 
 #Record time
-cpu_time = time.time() - start
+#cpu_time = time.time() - start
 
 #Normalize CPU Sobel output
-cpu_result_norm = np.clip(cpu_result, 0, 255)
+#cpu_result_norm = np.clip(cpu_result, 0, 255)
 
 #Convert normalize result to image format
-Image.fromarray(cpu_result_norm.astype(np.uint8)).save("cpu_sobel.jpg")
+#Image.fromarray(cpu_result_norm.astype(np.uint8)).save("cpu_sobel.jpg")
 
 
 #Print out all results and comparisons
 print("\n--- PERFORMANCE RESULTS ---")
-print(f"CPU Sobel Edge Detection Time: {cpu_time:.6f} seconds")
+#print(f"CPU Histogram Equalization: {cpu_time:.6f} seconds")
 
 print("\n--- GPU TIMINGS ---")
 print(f"H2D Transfer Time: {h2d_time:.6f} seconds")
 print(f"D2H Transfer Time: {d2h_time:.6f} seconds")
 
 print("\n--- KERNEL TIMES ---")
-print(f"GPU Shared Memory Time: {gpu_shared_time:.6f} seconds")
+print(f"GPU Shared Memory Time: {gpu_time:.6f} seconds")
 
 print("\n--- SPEEDUPS ---")
-print(f"CPU vs Shared Speedup: {cpu_time / gpu_shared_time:.6f}x")
+#print(f"CPU vs Shared Speedup: {cpu_time / gpu_shared_time:.6f}x")
 
-print(f"\nTotal GPU Time: {h2d_time + gpu_shared_time + d2h_time:.6f} seconds")
+print(f"\nTotal GPU Time: {h2d_time + gpu_time + d2h_time:.6f} seconds")
