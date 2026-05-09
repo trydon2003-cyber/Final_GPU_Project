@@ -11,7 +11,7 @@ import time
 
 #Find and load image, and define it as a variable, interpreet it in greyscale mode
 img = Image.open(r"C:\Users\TryDo\Downloads\pexels-jplenio-1146708.jpg").convert("L")
-#Convert the image into a NumPy matrix as float32 type
+#Convert the image into a NumPy matrix as uint 8 type
 arr = np.array(img, dtype=np.uint8)
 #Define the height and width of the image.
 height, width = arr.shape
@@ -35,7 +35,7 @@ cuda.memset_d32(hist_gpu, 0, 256)
 #Copy NumPy array from CPU to GPU memory
 cuda.memcpy_htod(img_gpu, arr)
 
-# CUDA Kernel, now with shared memory
+#CUDA Kernel, now with shared memory
 #SourceModule is a function that compiles all of our CUDA C code.
 mod = SourceModule("""
 #include <stdio.h>
@@ -190,26 +190,88 @@ cuda.memcpy_dtoh(gpu_result, out_gpu)
 
 d2h_time = time.time() - start
 
+def histogram_equalization_cpu(image):
+    #Ensure uint8 grayscale input
+    image = image.astype(np.uint8)
+
+    #Get image dimensions
+    height, width = image.shape
+    size = height * width
+
+    #Create histogram with 256 bins
+    hist = np.zeros(256, dtype=np.int32)
+
+    #Flatten image into 1D array
+    flat = image.flatten()
+
+    #Count pixel intensities
+    for pixel in flat:
+        hist[pixel] += 1
+
+
+    #Cumulative Distribution Function
+    cdf = np.cumsum(hist).astype(np.int32)
+
+    #Find first non-zero CDF value
+    cdf_min = 0
+
+    for v in cdf:
+        if v != 0:
+            cdf_min = v
+            break
+
+    #Create output image
+    output = np.zeros_like(flat, dtype=np.uint8)
+
+    #Normalization denominator
+    denom = float(size - cdf_min)
+
+    #Prevent divide-by-zero
+    if denom < 1.0:
+        denom = 1.0
+
+    #Equalize each pixel
+    for i in range(size):
+
+        pixel = flat[i]
+
+        #Histogram equalization formula
+        value = ((cdf[pixel] - cdf_min) / denom) * 255.0
+
+        #Clamp values
+        if value < 0:
+            value = 0
+
+        if value > 255:
+            value = 255
+
+        #Store result
+        output[i] = np.uint8(value)
+
+    #Reshape back into image dimensions
+    output = output.reshape((height, width))
+
+    return output
 
 #Start CPU timer
-#start = time.time()
+start = time.time()
 
-#Run CPU Sobel Function
-#cpu_result = sobel_cpu(arr)
+#Run CPU histogram Function
+cpu_result = histogram_equalization_cpu(arr)
 
 #Record time
-#cpu_time = time.time() - start
+cpu_time = time.time() - start
 
-#Normalize CPU Sobel output
-#cpu_result_norm = np.clip(cpu_result, 0, 255)
+#Normalize CPU histogram output
+cpu_result_norm = np.clip(cpu_result, 0, 255)
 
 #Convert normalize result to image format
-#Image.fromarray(cpu_result_norm.astype(np.uint8)).save("cpu_sobel.jpg")
+Image.fromarray(cpu_result_norm.astype(np.uint8)).save("cpu_histogram.jpg")
 
 
 #Print out all results and comparisons
 print("\n--- PERFORMANCE RESULTS ---")
-#print(f"CPU Histogram Equalization: {cpu_time:.6f} seconds")
+print(f"CPU Histogram Equalization: {cpu_time:.6f} seconds")
 
 print("\n--- GPU TIMINGS ---")
 print(f"H2D Transfer Time: {h2d_time:.6f} seconds")
@@ -219,6 +281,6 @@ print("\n--- KERNEL TIMES ---")
 print(f"GPU Shared Memory Time: {gpu_time:.6f} seconds")
 
 print("\n--- SPEEDUPS ---")
-#print(f"CPU vs Shared Speedup: {cpu_time / gpu_shared_time:.6f}x")
+print(f"CPU vs Shared Speedup: {cpu_time / gpu_time:.6f}x")
 
 print(f"\nTotal GPU Time: {h2d_time + gpu_time + d2h_time:.6f} seconds")
