@@ -41,3 +41,19 @@ GPU Shared Memory Time: 0.000312 seconds
 CPU vs Shared Speedup: 140866.641731x
 
 Total GPU Time: 0.018829 seconds
+
+Histogram Equalization table:
+--- PERFORMANCE RESULTS ---
+CPU Histogram Equalization: 19.391740 seconds
+
+--- GPU TIMINGS ---
+H2D Transfer Time: 0.001003 seconds
+D2H Transfer Time: 0.002003 seconds
+
+--- KERNEL TIMES ---
+GPU Shared Memory Time: 0.001425 seconds
+
+--- SPEEDUPS ---
+CPU vs Shared Speedup: 13611.982885x
+
+Total GPU Time: 0.004431 seconds
