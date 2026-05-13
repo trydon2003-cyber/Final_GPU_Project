@@ -8,6 +8,7 @@ Hardware Used for this project:
     2. Hit control + Shift + P to open the command pallet
     3. Enter Python Create Enviroment, and click Venv.
     4. Select Python 3.11.9, make sure to close current terminal and opening a new one.
+    5. Enter the commands: "pip install pycuda", "pip install pillow","pip install pylance","pip install numpy".
 
 Performance Table Summary:
 Gaussian Blur table
