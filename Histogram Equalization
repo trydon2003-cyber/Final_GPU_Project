@@ -11,20 +11,31 @@ import time
 
 #Find and load image, and define it as a variable, interpreet it in greyscale mode
 img = Image.open(r"C:\Users\TryDo\Downloads\pexels-jplenio-1146708.jpg").convert("L")
-#Convert the image into a NumPy matrix as float32 type
-arr = np.array(img, dtype=np.float32)
+#Convert the image into a NumPy matrix as uint 8 type
+arr = np.array(img, dtype=np.uint8)
 #Define the height and width of the image.
 height, width = arr.shape
+size = height * width
 
 #Allocate GPU memory
 #Create an GPU side array that is the same size as the image
 img_gpu = cuda.mem_alloc(arr.nbytes)
-#Copy NumPy array from CPU to GPU memory
-cuda.memcpy_htod(img_gpu, arr)
+
 #Allocate another GPU buffer that will store the blurred image
 out_gpu = cuda.mem_alloc(arr.nbytes)
 
-# CUDA Kernel, now with shared memory
+#Histogram and CDF buffers
+#Create space on the GPU for the histogram
+hist_gpu = cuda.mem_alloc(256 * np.int32().nbytes)
+#Create space on the GPU for the Cumulative Distribution Function
+cdf_gpu  = cuda.mem_alloc(256 * np.int32().nbytes)
+#Initialize histogram on GPU
+cuda.memset_d32(hist_gpu, 0, 256)
+
+#Copy NumPy array from CPU to GPU memory
+cuda.memcpy_htod(img_gpu, arr)
+
+#CUDA Kernel, now with shared memory
 #SourceModule is a function that compiles all of our CUDA C code.
 mod = SourceModule("""
 #include <stdio.h>
@@ -32,59 +43,81 @@ mod = SourceModule("""
 //Constant histogram size               
 #define BINS 256
 
-//KERNEL 1: SHARED MEMORY HISTOGRAM (BLOCK-LOCAL)
-__global__ void histogram_kernel(unsigned char* input,int* global_hist,int size)
+//Kernel 1: Shared Memory Histogram
+__global__ void histogram_kernel(unsigned char* input, int* hist, int size)
 {
-    
-    //Allocate shared memory per block
-    __shared__ int local_hist[BINS];
+    //Creates histogram inside fast shared memory
+    __shared__ int local_hist[256];
 
-    //Thread index inside the block
+    //Each thread is mapped to local index inside the block
     int tid = threadIdx.x;
-    //Computes global pixel index
+    //Compute which image pixel this thread processess
     int idx = blockIdx.x * blockDim.x + tid;
 
-    //Initialize shared histogram
-    if (tid < BINS)
-        local_hist[tid] = 0;
-    
-    //Ensure all threads finish initialization
+    //Initialize shared histogram memory
+    for (int i = tid; i < 256; i += blockDim.x)
+        local_hist[i] = 0;
+
+    //Force all threads in block to wait, prevents race conditions
     __syncthreads();
-
-    //Build block-local histogram
-    if (idx < size)
+                   
+  if (idx < size)
     {
-        //Read pixel intensity
+        //Load grayscale pixel
         unsigned char pixel = input[idx];
-
-        //Increments histogram bin and prevents race conditions
+        //Increment the histogram bin
         atomicAdd(&local_hist[pixel], 1);
     }
-
-    //Ensure all pixels are processed
+                   
+    //Ensure histogram update is complete
     __syncthreads();
 
-    
-    //Merge into global histogram
-    if (tid < BINS)
+    if (tid < 256)
+        //Merge into global histogram
+        atomicAdd(&hist[tid], local_hist[tid]);
+}
+
+//Kernel 2: Equalization                   
+__global__ void equalization_kernel(unsigned char* input,unsigned char* output, int* cdf,
+int size,int cdf_min)
+{
+    //Create unique global pixel index per thread
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+
+   if (idx < size)
     {
-        //Each block constributes its histrogram
-        atomicAdd(&global_hist[tid], local_hist[tid]);
+        int pixel = input[idx];
+
+        //Normalize histogram equaliztion
+        float denom = (float)(size - cdf_min);
+        //Prevents divide by zero errors
+        if (denom < 1.0f) denom = 1.0f;
+
+        //Histogram equalization formula, redistributes intensities.
+        float value = ((cdf[pixel] - cdf_min) / denom) * 255.0f;
+                   
+        //Prevent invalid negative intensities
+        if (value < 0) value = 0;
+        //Prevents overflow beyound 8-bit
+        if (value > 255) value = 255;
+
+        output[idx] = (unsigned char)value;
     }
 }
 """)
 
 #Connects Python code to compiled CUDA kernel, and lets us execute the GPU code
-func = mod.get_function("histrogram_kernl")
+hist = mod.get_function("histogram_kernel")
+eq = mod.get_function("equalization_kernel")
 
 
 #Establish the blocks and grid
-#Allow for non-square support
-block_size = (16, 4, 1)  
+block_size = (256, 1, 1)  
 
 grid_size = (
-    (width + block_size[0] - 1) // block_size[0],
-    (height + block_size[1] - 1) // block_size[1]
+    (size + block_size[0] - 1) // block_size[0],
+    1,
+    1
 )
 
 
@@ -101,60 +134,153 @@ end_event = cuda.Event()
 #Start recording time
 start_event.record()
 
-#Call shared memory function
+#Run histogram kernl
+hist(img_gpu, hist_gpu, np.int32(size),block=block_size, grid=grid_size)
+
+#Create CPU histogram array
+hist_cpu = np.zeros(256, dtype=np.int32)
+#Copy histogram from GPU to CPU
+cuda.memcpy_dtoh(hist_cpu, hist_gpu)
+
+#Compute the CDF
+cdf = np.cumsum(hist_cpu).astype(np.int32)
+
+#Initialize minimum non-zero CDF
+cdf_min = 0
+#Iterates through the CDF
+for v in cdf:
+    #Make sure the CDF has a value
+    if v != 0:
+        #Store first non-zero cumulative frequency
+        cdf_min = v
+        break
+
+#Send the CDF to the GPU
+cuda.memcpy_htod(cdf_gpu,cdf)
+
+#Run equalization kernel
+eq(img_gpu, out_gpu, cdf_gpu,np.int32(size), np.int32(cdf_min),block=block_size, grid=grid_size)
 
 #Synchronize threads for better time accuracy
 end_event.record()
 end_event.synchronize()
 
 #Record time and convert to seconds
-gpu_shared_time = start_event.time_till(end_event) * 1e-3 
+gpu_time = start_event.time_till(end_event) * 1e-3 
 
+#Create an empty array
+result = np.empty_like(arr)
+#Copy data from GPU to CPU
+cuda.memcpy_dtoh(result, out_gpu)
+
+#Save new image result
+Image.fromarray(result).save("gpu_equalized.jpg")
 
 #D2H Transfer timing
+end_event.record()
+end_event.synchronize()
+
 start = time.time()
 
-#Create a new NumPy array
+# Create output buffer
 gpu_result = np.empty_like(arr)
-#Device to host copy
+
+# Copy final equalized image back to host
 cuda.memcpy_dtoh(gpu_result, out_gpu)
 
 d2h_time = time.time() - start
 
-#Normalize Sobel output
-gpu_result_norm = np.clip(gpu_result, 0, 255)
-#Save image after Sobel edge detection
-Image.fromarray(gpu_result_norm.astype(np.uint8)).save("gpu_sobel.jpg")
+def histogram_equalization_cpu(image):
+    #Ensure uint8 grayscale input
+    image = image.astype(np.uint8)
 
+    #Get image dimensions
+    height, width = image.shape
+    size = height * width
+
+    #Create histogram with 256 bins
+    hist = np.zeros(256, dtype=np.int32)
+
+    #Flatten image into 1D array
+    flat = image.flatten()
+
+    #Count pixel intensities
+    for pixel in flat:
+        hist[pixel] += 1
+
+
+    #Cumulative Distribution Function
+    cdf = np.cumsum(hist).astype(np.int32)
+
+    #Find first non-zero CDF value
+    cdf_min = 0
+
+    for v in cdf:
+        if v != 0:
+            cdf_min = v
+            break
+
+    #Create output image
+    output = np.zeros_like(flat, dtype=np.uint8)
+
+    #Normalization denominator
+    denom = float(size - cdf_min)
+
+    #Prevent divide-by-zero
+    if denom < 1.0:
+        denom = 1.0
+
+    #Equalize each pixel
+    for i in range(size):
+
+        pixel = flat[i]
+
+        #Histogram equalization formula
+        value = ((cdf[pixel] - cdf_min) / denom) * 255.0
+
+        #Clamp values
+        if value < 0:
+            value = 0
+
+        if value > 255:
+            value = 255
+
+        #Store result
+        output[i] = np.uint8(value)
+
+    #Reshape back into image dimensions
+    output = output.reshape((height, width))
+
+    return output
 
 #Start CPU timer
-#start = time.time()
+start = time.time()
 
-#Run CPU Sobel Function
-#cpu_result = sobel_cpu(arr)
+#Run CPU histogram Function
+cpu_result = histogram_equalization_cpu(arr)
 
 #Record time
-#cpu_time = time.time() - start
+cpu_time = time.time() - start
 
-#Normalize CPU Sobel output
-#cpu_result_norm = np.clip(cpu_result, 0, 255)
+#Normalize CPU histogram output
+cpu_result_norm = np.clip(cpu_result, 0, 255)
 
 #Convert normalize result to image format
-#Image.fromarray(cpu_result_norm.astype(np.uint8)).save("cpu_sobel.jpg")
+Image.fromarray(cpu_result_norm.astype(np.uint8)).save("cpu_histogram.jpg")
 
 
 #Print out all results and comparisons
 print("\n--- PERFORMANCE RESULTS ---")
-#print(f"CPU Histogram Equalization: {cpu_time:.6f} seconds")
+print(f"CPU Histogram Equalization: {cpu_time:.6f} seconds")
 
 print("\n--- GPU TIMINGS ---")
 print(f"H2D Transfer Time: {h2d_time:.6f} seconds")
 print(f"D2H Transfer Time: {d2h_time:.6f} seconds")
 
 print("\n--- KERNEL TIMES ---")
-print(f"GPU Shared Memory Time: {gpu_shared_time:.6f} seconds")
+print(f"GPU Shared Memory Time: {gpu_time:.6f} seconds")
 
 print("\n--- SPEEDUPS ---")
-#print(f"CPU vs Shared Speedup: {cpu_time / gpu_shared_time:.6f}x")
+print(f"CPU vs Shared Speedup: {cpu_time / gpu_time:.6f}x")
 
-print(f"\nTotal GPU Time: {h2d_time + gpu_shared_time + d2h_time:.6f} seconds")
+print(f"\nTotal GPU Time: {h2d_time + gpu_time + d2h_time:.6f} seconds")
